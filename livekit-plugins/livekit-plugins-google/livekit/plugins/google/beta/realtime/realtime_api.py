@@ -775,7 +775,7 @@ class RealtimeSession(llm.RealtimeSession):
                 ),
                 language_code=self._opts.language if is_given(self._opts.language) else None,
             ),
-            tools=tools_config,  # type: ignore
+            tools=tools_config,
             input_audio_transcription=self._opts.input_audio_transcription,
             output_audio_transcription=self._opts.output_audio_transcription,
             session_resumption=types.SessionResumptionConfig(
@@ -829,6 +829,7 @@ class RealtimeSession(llm.RealtimeSession):
             message_stream=self._current_generation.message_ch,
             function_stream=self._current_generation.function_ch,
             user_initiated=False,
+            response_id=self._current_generation.response_id,
         )
 
         if self._pending_generation_fut and not self._pending_generation_fut.done():
@@ -969,7 +970,7 @@ class RealtimeSession(llm.RealtimeSession):
             gen.function_ch.send_nowait(
                 llm.FunctionCall(
                     call_id=fnc_call.id or utils.shortuuid("fnc-call-"),
-                    name=fnc_call.name,  # type: ignore
+                    name=fnc_call.name,
                     arguments=arguments,
                 )
             )
