@@ -9,7 +9,7 @@ from collections.abc import AsyncIterable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
-from opentelemetry import trace
+from opentelemetry import context as otel_context, trace
 
 from livekit import rtc
 from livekit.agents.llm.realtime import MessageGeneration
@@ -26,6 +26,7 @@ from ..metrics import (
     VADMetrics,
 )
 from ..telemetry import trace_types, tracer
+from ..telemetry.realtime_span_manager import RealtimeSpanManager
 from ..tokenize.basic import split_words
 from ..types import NOT_GIVEN, NotGivenOr
 from ..utils.misc import is_given
@@ -88,6 +89,9 @@ class AgentActivity(RecognitionHooks):
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
         self._agent, self._session = agent, sess
         self._rt_session: llm.RealtimeSession | None = None
+        # OpenTelemetry span manager for realtime generations (initialized when needed)
+        self._realtime_span_manager: RealtimeSpanManager | None = None
+
         self._audio_recognition: AudioRecognition | None = None
         self._lock = asyncio.Lock()
         self._tool_choice: llm.ToolChoice | None = None
@@ -360,7 +364,19 @@ class AgentActivity(RecognitionHooks):
         if speech_handle is not None:
             tk1 = _SpeechHandleContextVar.set(speech_handle)
 
-        task = asyncio.create_task(coro, name=name)
+        # Capture the current OpenTelemetry context to ensure proper span nesting
+        current_context = otel_context.get_current()
+
+        # Create a wrapper coroutine that runs in the captured context
+        async def _context_aware_coro() -> Any:
+            # Attach the captured context before running the original coroutine
+            token = otel_context.attach(current_context)
+            try:
+                return await coro
+            finally:
+                otel_context.detach(token)
+
+        task = asyncio.create_task(_context_aware_coro(), name=name)
         self._speech_tasks.append(task)
         task.add_done_callback(lambda _: self._speech_tasks.remove(task))
 
@@ -502,6 +518,18 @@ class AgentActivity(RecognitionHooks):
                 await self._rt_session.update_tools(self.tools)
             except llm.RealtimeError:
                 logger.exception("failed to update the tools")
+
+            # Initialize realtime span manager for metrics attribution
+            self._realtime_span_manager = RealtimeSpanManager(maxsize=100)
+
+            # Set model name for span manager metrics attribution
+            try:
+                # This attribute is specific to OpenAI realtime model.
+                # TODO: implement a generic way across all realtime models to obtain the model name
+                model_name = self.llm._opts.model  # type: ignore[attr-defined]
+            except AttributeError:
+                model_name = "unknown-realtime-model"
+            self._realtime_span_manager.model_name = model_name
 
             if (
                 not self.llm.capabilities.audio_output
@@ -672,6 +700,10 @@ class AgentActivity(RecognitionHooks):
 
             if self._scheduling_atask is not None:
                 await utils.aio.cancel_and_wait(self._scheduling_atask)
+
+            # Clear all span references to prevent memory leaks
+            if self._realtime_span_manager is not None:
+                self._realtime_span_manager.clear()
 
             self._agent._activity = None
 
@@ -991,6 +1023,8 @@ class AgentActivity(RecognitionHooks):
             isinstance(ev, LLMMetrics) or isinstance(ev, TTSMetrics)
         ):
             ev.speech_id = speech_handle.id
+        if isinstance(ev, RealtimeModelMetrics) and self._realtime_span_manager is not None:
+            self._realtime_span_manager.attach_realtime_metrics_to_span(ev)
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
 
     def _on_error(
@@ -1141,7 +1175,7 @@ class AgentActivity(RecognitionHooks):
         if ev.speech_duration >= self._session.options.min_interruption_duration:
             self._interrupt_by_audio_activity()
 
-    def on_interim_transcript(self, ev: stt.SpeechEvent) -> None:
+    def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
             # skip stt transcription if user_transcription is enabled on the realtime model
             return
@@ -1157,6 +1191,14 @@ class AgentActivity(RecognitionHooks):
 
         if ev.alternatives[0].text:
             self._interrupt_by_audio_activity()
+
+            if (
+                speaking is False
+                and self._paused_speech
+                and (timeout := self._session.options.false_interruption_timeout) is not None
+            ):
+                # schedule a resume timer if interrupted after end_of_speech
+                self._start_false_interruption_timer(timeout)
 
     def on_final_transcript(self, ev: stt.SpeechEvent) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
@@ -1888,8 +1930,19 @@ class AgentActivity(RecognitionHooks):
         current_span = trace.get_current_span()
         current_span.set_attribute(trace_types.ATTR_SPEECH_ID, speech_handle.id)
 
+        # Store the span context for OpenTelemetry metrics attribution
+        # Use the response_id from the generation event when available
+        if generation_ev.response_id and self._realtime_span_manager is not None:
+            self._realtime_span_manager.track_span(generation_ev.response_id, current_span)
+
         assert self._rt_session is not None, "rt_session is not available"
         assert isinstance(self.llm, llm.RealtimeModel), "llm is not a realtime model"
+        assert self._realtime_span_manager is not None, "realtime span manager is not available"
+
+        # Set the model name on the current span for this specific generation
+        current_span.set_attribute(
+            trace_types.ATTR_GEN_AI_REQUEST_MODEL, self._realtime_span_manager.model_name
+        )
 
         audio_output = self._session.output.audio if self._session.output.audio_enabled else None
         text_output = (
@@ -1943,17 +1996,6 @@ class AgentActivity(RecognitionHooks):
                     else:
                         tr_text_input = msg.text_stream.__aiter__()
 
-                    # text output
-                    tr_node = self._agent.transcription_node(tr_text_input, model_settings)
-                    tr_node_result = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
-                    text_out: _TextOutput | None = None
-                    if tr_node_result is not None:
-                        forward_task, text_out = perform_text_forwarding(
-                            text_output=text_output,
-                            source=tr_node_result,
-                        )
-                        forward_tasks.append(forward_task)
-
                     # audio output
                     audio_out = None
                     if audio_output is not None:
@@ -1964,6 +2006,18 @@ class AgentActivity(RecognitionHooks):
                                 input=tts_text_input,
                                 model_settings=model_settings,
                             )
+
+                            if (
+                                self.use_tts_aligned_transcript
+                                and (tts := self.tts)
+                                and (
+                                    tts.capabilities.aligned_transcript
+                                    or not tts.capabilities.streaming
+                                )
+                                and (timed_texts := await tts_gen_data.timed_texts_fut)
+                            ):
+                                tr_text_input = timed_texts
+
                             tasks.append(tts_task)
                             realtime_audio_result = tts_gen_data.audio_ch
                         elif "audio" in msg_modalities:
@@ -1993,7 +2047,19 @@ class AgentActivity(RecognitionHooks):
                             )
                             forward_tasks.append(forward_task)
                             audio_out.first_frame_fut.add_done_callback(_on_first_frame)
-                    elif text_out is not None:
+
+                    # text output
+                    tr_node = self._agent.transcription_node(tr_text_input, model_settings)
+                    tr_node_result = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
+                    text_out: _TextOutput | None = None
+                    if tr_node_result is not None:
+                        forward_task, text_out = perform_text_forwarding(
+                            text_output=text_output,
+                            source=tr_node_result,
+                        )
+                        forward_tasks.append(forward_task)
+
+                    if not audio_out and text_out:
                         text_out.first_text_fut.add_done_callback(_on_first_frame)
 
                     outputs.append((msg, text_out, audio_out))

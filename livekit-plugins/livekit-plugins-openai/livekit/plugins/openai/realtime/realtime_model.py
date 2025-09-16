@@ -1074,7 +1074,7 @@ class RealtimeSession(
         return SessionUpdateEvent(
             type="session.update",
             session=session_update_event.Session.model_construct(
-                model=self._realtime_model._opts.model,
+                model=self._realtime_model._opts.model,  # type: ignore
                 tools=oai_tools,
             ),
             event_id=utils.shortuuid("tools_update_"),
@@ -1231,6 +1231,7 @@ class RealtimeSession(
             message_stream=self._current_generation.message_ch,
             function_stream=self._current_generation.function_ch,
             user_initiated=False,
+            response_id=event.response.id,
         )
 
         if (
